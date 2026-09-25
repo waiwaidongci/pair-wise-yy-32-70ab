@@ -1,1 +1,158 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>批次放行预检与复核</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1150px;margin:28px auto;padding:0 20px;color:#1c2733}
+h1{font-size:22px;margin-bottom:4px}
+h2{font-size:16px;margin:14px 0 8px}
+section{border:1px solid #d8dee4;border-radius:8px;padding:14px 16px;margin-bottom:14px}
+label{margin-right:14px;white-space:nowrap}
+input,select,textarea{padding:6px 8px;font:inherit}
+textarea{width:100%;min-height:52px;box-sizing:border-box;margin:6px 0}
+button{padding:7px 14px;font:inherit;cursor:pointer}
+.badge{display:inline-block;padding:2px 12px;border-radius:12px;color:#fff;font-size:13px;vertical-align:middle}
+.b-release{background:#1a7f37}.b-conditional{background:#bf8700}.b-blocked{background:#cf222e}
+ul{margin:6px 0;padding-left:22px}
+li.blocker{color:#cf222e}
+li.warning{color:#9a6700}
+table{border-collapse:collapse;width:100%;margin-top:6px}
+td,th{border:1px solid #d8dee4;padding:5px 8px;text-align:left;font-size:13px}
+th{background:#f6f8fa}
+.muted{color:#57606a;font-size:13px}
+#msg{white-space:pre-wrap;font-size:14px}
+.ok{color:#1a7f37}.err{color:#cf222e}
+.tag{font-size:12px;padding:1px 8px;border-radius:10px;background:#eaeef2}
+.tag.stale{background:#ffebe9;color:#cf222e}
+pre{background:#f3f5f7;padding:12px;overflow:auto;font-size:12px;max-height:320px}
+</style>
+<h1>药品批次放行预检与复核</h1>
+<p class="muted">预检规则、存储与页面分层：本页只调用接口。偏差、检验、返工或稳定性资料一旦修改，批次版本递增，旧复核自动失效，需重新预检复核后才能放行。</p>
+
+<section>
+  <label>操作人 <input id="actor" value="qa-wang" size="10"></label>
+  <label>角色 <select id="role">
+    <option value="qa">qa</option><option value="operator">operator</option>
+    <option value="inspector">inspector</option><option value="lab">lab</option>
+  </select></label>
+  <label>批次 <select id="batchSel"></select></label>
+  <button onclick="loadState()">刷新批次列表</button>
+</section>
+
+<section id="overview"><p class="muted">请选择批次</p></section>
+<section id="precheck"></section>
+<section id="reviews"></section>
+
+<section>
+  <h2>QA 复核</h2>
+  <label>结论 <select id="conclusion">
+    <option value="release">正式放行</option>
+    <option value="conditional">有条件放行</option>
+    <option value="blocked">不可放行</option>
+  </select></label>
+  <span class="muted">结论不允许比预检判断更宽松；保存时冻结当前批次版本</span>
+  <textarea id="comment" placeholder="复核意见（必填）"></textarea>
+  <button onclick="submitReview()">保存复核结论</button>
+</section>
+
+<section>
+  <h2>放行决定（须引用有效复核）</h2>
+  <label>决定 <select id="decision">
+    <option value="release">正式放行</option>
+    <option value="conditional">有条件放行</option>
+    <option value="resample">再取样</option>
+    <option value="reject">拒绝</option>
+  </select></label>
+  <label>复核编号 <input id="reviewId" size="6"></label>
+  <label>例外编号 <input id="excCode" size="8" placeholder="有条件放行必填"></label>
+  <textarea id="rationale" placeholder="决定依据（必填）"></textarea>
+  <button onclick="submitDecision()">提交放行决定</button>
+</section>
+
+<section><h2>消息</h2><div id="msg" class="muted">-</div></section>
+<section><h2>批次原始数据</h2><pre id="raw">-</pre></section>
+
+<script>
+let current = null;
+const $ = id => document.getElementById(id);
+const REC = {release: '正式放行', conditional: '有条件放行', blocked: '不可放行'};
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function say(text, ok){ const m = $('msg'); m.textContent = text; m.className = ok ? 'ok' : 'err'; }
+function hdrs(){ return {'Content-Type':'application/json','X-Actor':$('actor').value,'X-Role':$('role').value}; }
+async function api(path, opts){
+  const r = await fetch(path, opts); const b = await r.json();
+  if(!r.ok) throw new Error(b.error || ('HTTP ' + r.status));
+  return b;
+}
+async function loadState(){
+  try{
+    const s = await api('/api/state');
+    const sel = $('batchSel'); const keep = sel.value;
+    sel.innerHTML = s.batches.map(b =>
+      `<option value="${b.id}">${esc(b.batch_no)}｜${esc(b.product)}｜${b.state}｜v${b.revision}</option>`).join('');
+    if(keep) sel.value = keep;
+    if(sel.value) await loadBatch(sel.value);
+    else say('暂无批次，请先通过接口创建', false);
+  }catch(e){ say(e.message, false); }
+}
+async function loadBatch(id){
+  try{ current = await api('/api/batches/' + id); render(); }
+  catch(e){ say(e.message, false); }
+}
+function render(){
+  const b = current.batch, p = current.precheck;
+  $('overview').innerHTML = `<h2>批次 ${esc(b.batch_no)}（${esc(b.product)}）</h2>
+    状态 <b>${b.state}</b> ｜ 版本 v${b.revision} ｜ 生产 ${b.mfg_date} ｜ 有效期至 ${b.expiry_date}`;
+  $('precheck').innerHTML =
+    `<h2>放行预检 <span class="badge b-${p.recommendation}">${REC[p.recommendation]}</span>
+     <span class="muted">预检时间 ${p.generated_at}</span></h2>` +
+    (p.blockers.length
+      ? `<b>阻断项（${p.blockers.length}）</b><ul>${p.blockers.map(x => `<li class="blocker">${esc(x.message)}</li>`).join('')}</ul>`
+      : '<p class="muted">无阻断项</p>') +
+    (p.warnings.length
+      ? `<b>提醒项（${p.warnings.length}）</b><ul>${p.warnings.map(x => `<li class="warning">${esc(x.message)}</li>`).join('')}</ul>`
+      : '<p class="muted">无提醒项</p>');
+  $('conclusion').value = p.recommendation;
+  const valid = current.reviews.find(r => r.valid);
+  $('reviewId').value = valid ? valid.id : '';
+  $('reviews').innerHTML = '<h2>复核记录</h2>' + (current.reviews.length
+    ? `<table><tr><th>#</th><th>结论</th><th>冻结版本</th><th>状态</th><th>复核意见</th><th>复核人</th><th>时间</th></tr>` +
+      current.reviews.map(r =>
+        `<tr><td>${r.id}</td><td>${REC[r.conclusion]}</td><td>v${r.revision}</td>` +
+        `<td>${r.valid ? '<span class="tag">有效</span>' : '<span class="tag stale">已失效</span>'}</td>` +
+        `<td>${esc(r.comment)}</td><td>${esc(r.reviewed_by)}</td><td>${r.created_at}</td></tr>`).join('') + '</table>'
+    : '<p class="muted">尚无复核记录</p>') +
+    (current.decisions.length
+      ? `<h2>放行决定</h2><table><tr><th>#</th><th>决定</th><th>引用复核</th><th>依据</th><th>决定人</th><th>时间</th></tr>` +
+        current.decisions.map(d =>
+          `<tr><td>${d.id}</td><td>${d.decision}</td><td>${d.review_id ?? '-'}</td>` +
+          `<td>${esc(d.rationale)}</td><td>${esc(d.decided_by)}</td><td>${d.created_at}</td></tr>`).join('') + '</table>'
+      : '');
+  $('raw').textContent = JSON.stringify(current, null, 2);
+}
+async function submitReview(){
+  if(!current) return say('请先选择批次', false);
+  try{
+    const r = await api(`/api/batches/${current.batch.id}/reviews`,
+      {method:'POST', headers:hdrs(), body:JSON.stringify({conclusion:$('conclusion').value, comment:$('comment').value})});
+    say(`复核 #${r.id} 已保存：${REC[r.conclusion]}（冻结版本 v${r.revision}）`, true);
+    await loadState();
+  }catch(e){ say(e.message, false); }
+}
+async function submitDecision(){
+  if(!current) return say('请先选择批次', false);
+  try{
+    const body = {decision:$('decision').value, rationale:$('rationale').value,
+                  exception_code:$('excCode').value, expected_revision:current.batch.revision};
+    if($('reviewId').value) body.review_id = Number($('reviewId').value);
+    const r = await api(`/api/batches/${current.batch.id}/decide`,
+      {method:'POST', headers:hdrs(), body:JSON.stringify(body)});
+    say(`决定已记录：批次状态变为 ${r.batch.state}`, true);
+    await loadState();
+  }catch(e){ say(e.message, false); }
+}
+$('batchSel').onchange = () => loadBatch($('batchSel').value);
+loadState();
+</script>
+</html>
