@@ -31,9 +31,13 @@ class BatchFlowTest(unittest.TestCase):
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
         self.s.record_stability("lab", "lab", self.f1, batch["id"], "25C/60RH", "3m", 99, 105, current)
         current = self.s.batch_detail(batch["id"])["batch"]["revision"]
+        review = self.s.submit_review("qa", "qa", batch["id"], "release", "预检无阻断，同意放行", current)
+        self.assertEqual(current, review["review"]["revision"])
         result = self.s.decide("qa", "qa", batch["id"], "release", "调查关闭，复测合格", current)
         self.assertEqual("released", result["batch"]["state"])
-        self.assertEqual(1, len(result["batch"] and self.s.batch_detail(batch["id"])["decisions"]))
+        decisions = self.s.batch_detail(batch["id"])["decisions"]
+        self.assertEqual(1, len(decisions))
+        self.assertEqual(review["review"]["id"], decisions[0]["review_id"])
 
     def test_critical_block_conditional_exception_and_factory_conflict(self):
         batch = self.s.create_batch("operator", "operator", self.f1, "B-2", "胶囊", "2026-02-01", "2028-02-01")

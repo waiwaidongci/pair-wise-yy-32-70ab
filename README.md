@@ -19,8 +19,14 @@ python3 app.py
 - `POST /api/batches/{id}/tests`：记录检验和复测轮次。
 - `POST /api/batches/{id}/rework`、`POST /api/rework/{id}/complete`：计划和完成返工。
 - `POST /api/batches/{id}/supplier-changes`、`POST /api/batches/{id}/stability`：关联供应链和稳定性记录。
-- `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查。
-- `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+- `GET /api/batches/{id}`：批次详情，附带放行预检（阻断项、提醒项、正式/有条件/暂不可放行判断）和复核记录。
+- `POST /api/batches/{id}/reviews`：QA 提交复核（`conclusion` 为 `release`/`conditional`/`hold`，附复核意见与当前修订号）。
+- `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查；正式或有条件放行必须引用与当前修订号一致且结论相符的复核。
+- `GET /api/state`、`GET /api/health`：状态和健康检查。
+
+## 放行预检与复核
+
+规则（`release_rules.py`）、复核存储（`review_store.py`）和页面（`static/index.html`）分开承担。预检把未关闭关键偏差、无有效例外的一般偏差、缺失或不合格的检验、未完成的返工、超标稳定性数据列为阻断项；复测、已完成返工、供应商变更、缺失稳定性数据列为提醒项。QA 复核保存结论与批次修订号；偏差、检验、返工或稳定性资料变更会推进修订号，旧复核随之失效，需重新预检复核后才能放行。首页可选择批次查看预检结果并提交复核与决定。
 
 ## 测试
 

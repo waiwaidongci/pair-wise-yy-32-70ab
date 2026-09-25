@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import release_rules
+from review_store import ReviewStore
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -102,7 +105,9 @@ class Store:
 
 
 class BatchService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.reviews = ReviewStore(store.conn)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -235,6 +240,29 @@ class BatchService:
             self.store.audit(actor, "stability.record", "batch", batch_id, {"condition": condition, "timepoint": timepoint, "passed": bool(passed)})
         return dict(self._row("stability", cur.lastrowid))
 
+    def _precheck_for(self, batch_id: int) -> dict:
+        batch = self._row("batches", batch_id)
+        def rows(name: str) -> list[dict]:
+            return [dict(r) for r in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        return release_rules.precheck(dict(batch), rows("deviations"), rows("tests"), rows("rework"),
+                                      rows("supplier_changes"), rows("stability"))
+
+    def submit_review(self, actor: str | None, role: str | None, batch_id: int, conclusion: str, opinion: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        batch = self._row("batches", batch_id)
+        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次无需复核")
+        if conclusion not in release_rules.CONCLUSION_LABELS: raise ApiError(400, "复核结论不合法")
+        if not opinion.strip(): raise ApiError(400, "必须填写复核意见")
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次资料已变更，请重新预检后再提交复核")
+        pre = self._precheck_for(batch_id)
+        if conclusion not in release_rules.ALLOWED_CONCLUSIONS[pre["verdict"]]:
+            raise ApiError(409, f"预检判断为「{pre['verdict_label']}」，不能给出「{release_rules.CONCLUSION_LABELS[conclusion]}」结论")
+        with self.conn:
+            review = self.reviews.save(batch_id, int(batch["revision"]), conclusion, opinion.strip(), pre, actor, now())
+            self.store.audit(actor, "review.submit", "review", review["id"],
+                             {"batch_id": batch_id, "revision": batch["revision"], "conclusion": conclusion, "verdict": pre["verdict"]})
+        return {"review": review, "precheck": pre}
+
     def decide(self, actor: str | None, role: str | None, batch_id: int, decision: str, rationale: str, expected_revision: int, exception_code: str = "") -> dict:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
@@ -268,13 +296,19 @@ class BatchService:
             new_state = "conditional"
         else:
             new_state = "released"
+        review_id = None
+        if decision in {"release", "conditional"}:
+            review = self.reviews.valid_for(batch_id, int(batch["revision"]))
+            if not review: raise ApiError(409, "缺少与当前批次版本一致的放行复核，请先完成复核")
+            if review["conclusion"] != decision: raise ApiError(409, "复核结论与放行决定不一致，请重新复核")
+            review_id = review["id"]
         with self.conn:
-            cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,decided_by,created_at)
-                                     VALUES(?,?,?,?,?,?,?)""", (batch_id, batch["revision"], decision, rationale, exception_code or None, actor, now()))
+            cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,review_id,decided_by,created_at)
+                                     VALUES(?,?,?,?,?,?,?,?)""", (batch_id, batch["revision"], decision, rationale, exception_code or None, review_id, actor, now()))
             updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                         (new_state, now(), batch_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "并发放行冲突")
-            self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
+            self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code, "review_id": review_id})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
 
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
@@ -288,9 +322,15 @@ class BatchService:
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
-        return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
-                "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+        detail = {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
+                  "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
+                  "decisions": rows("decisions")}
+        detail["precheck"] = release_rules.precheck(batch, detail["deviations"], detail["tests"], detail["rework"],
+                                                    detail["supplier_changes"], detail["stability"])
+        detail["reviews"] = self.reviews.for_batch(batch_id)
+        latest = self.reviews.latest(batch_id)
+        detail["current_review"] = {**latest, "valid": latest["revision"] == batch["revision"]} if latest else None
+        return detail
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -355,6 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "rework"] and p[3] == "complete": out = self.service.complete_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "reviews": out = self.service.submit_review(actor, role, int(p[2]), b.get("conclusion", ""), b.get("opinion", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)

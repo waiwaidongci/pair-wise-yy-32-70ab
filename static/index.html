@@ -1,1 +1,102 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>批次放行预检与复核</title>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 20px;color:#1f2933}
+h1{font-size:22px}h2{font-size:17px;margin:0 0 8px}h3{font-size:14px;margin:12px 0 4px}
+section{border:1px solid #d9dee3;border-radius:8px;padding:14px 16px;margin:12px 0}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+label{font-size:13px;color:#52606d}
+input,select{padding:6px 8px;font:inherit}
+button{padding:7px 14px;cursor:pointer}
+.badge{display:inline-block;padding:3px 12px;border-radius:12px;color:#fff;font-size:13px;vertical-align:middle}
+.b-release{background:#2f9e44}.b-conditional{background:#f08c00}.b-blocked{background:#e03131}
+ul{margin:6px 0;padding-left:20px}
+.blockers li{color:#c92a2a}.warnings li{color:#ad6800}
+.ok{color:#2f9e44}.bad{color:#c92a2a}
+#msg{font-size:13px}
+table{border-collapse:collapse;font-size:13px;margin-top:6px}
+td,th{border:1px solid #d9dee3;padding:4px 8px;text-align:left}
+</style>
+<h1>药品批次放行预检与复核</h1>
+<section class="row">
+  <label>操作人 <input id="actor" value="qa-01"></label>
+  <label>角色 <select id="role"><option>qa</option><option>operator</option><option>inspector</option><option>lab</option></select></label>
+  <button onclick="loadState()">刷新批次列表</button>
+  <span id="msg"></span>
+</section>
+<section class="row">
+  <label>选择批次 <select id="batchSelect" onchange="loadDetail()"></select></label>
+</section>
+<section id="overview">请选择批次。</section>
+<section id="precheck"></section>
+<section id="review"></section>
+<section id="decide"></section>
+<script>
+const CL={release:"正式放行",conditional:"有条件放行",hold:"暂缓放行",reject:"拒收",resample:"再取样"};
+let current=null;
+function hdrs(){return {"Content-Type":"application/json","X-Actor":actor.value,"X-Role":role.value}}
+async function api(path,opts){const r=await fetch(path,opts);const b=await r.json();if(!r.ok)throw new Error(b.error||r.status);return b}
+function say(t,ok){msg.textContent=t;msg.className=ok?"ok":"bad"}
+async function loadState(keep){
+  try{
+    const s=await api("/api/state");
+    batchSelect.innerHTML=s.batches.map(b=>`<option value="${b.id}">#${b.id} ${b.batch_no}｜${b.product}｜${b.state}｜v${b.revision}</option>`).join("");
+    if(keep!=null)batchSelect.value=keep;
+    if(batchSelect.value)await loadDetail();else overview.textContent="暂无批次。";
+  }catch(e){say(e.message,false)}
+}
+async function loadDetail(){
+  if(!batchSelect.value)return;
+  try{current=await api(`/api/batches/${batchSelect.value}`);render();say("已加载批次 #"+current.batch.id,true)}
+  catch(e){say(e.message,false)}
+}
+function list(items,cls){return items.length?`<ul class="${cls}">${items.map(x=>`<li>${x.message}</li>`).join("")}</ul>`:"<p>无</p>"}
+function render(){
+  const d=current,b=d.batch,p=d.precheck;
+  overview.innerHTML=`<h2>批次 #${b.id} ${b.batch_no}</h2><div class="row">
+    <span>产品：${b.product}</span><span>状态：${b.state}</span><span>修订号：v${b.revision}</span>
+    <span>生产日期：${b.mfg_date}</span><span>有效期至：${b.expiry_date}</span></div>`;
+  precheck.innerHTML=`<h2>放行预检 <span class="badge b-${p.verdict}">${p.verdict_label}</span></h2>
+    <h3>阻断项（${p.blockers.length}）</h3>${list(p.blockers,"blockers")}
+    <h3>提醒项（${p.warnings.length}）</h3>${list(p.warnings,"warnings")}`;
+  const cr=d.current_review;
+  const status=cr?(cr.valid
+    ?`<span class="ok">复核 #${cr.id} 有效：${CL[cr.conclusion]}（基于 v${cr.revision}，${cr.created_by}）</span>`
+    :`<span class="bad">复核 #${cr.id} 已失效（基于 v${cr.revision}，当前 v${b.revision}），资料已变更，需重新预检并复核</span>`)
+    :"尚无复核记录，请先复核再决定放行。";
+  const rh=d.reviews.map(r=>`<tr><td>${r.id}</td><td>v${r.revision}</td><td>${CL[r.conclusion]}</td><td>${r.opinion}</td><td>${r.created_by}</td><td>${r.created_at}</td><td>${r.revision===b.revision?"有效":"已失效"}</td></tr>`).join("");
+  review.innerHTML=`<h2>QA 复核</h2><p>当前复核：${status}</p>
+    <div class="row">
+      <label>结论 <select id="conclusion"><option value="release">正式放行</option><option value="conditional">有条件放行</option><option value="hold">暂缓放行</option></select></label>
+      <label>复核意见 <input id="opinion" size="42" placeholder="填写复核意见"></label>
+      <button onclick="submitReview()">保存复核</button>
+    </div>
+    ${d.reviews.length?`<h3>复核历史</h3><table><tr><th>#</th><th>版本</th><th>结论</th><th>意见</th><th>复核人</th><th>时间</th><th>状态</th></tr>${rh}</table>`:""}`;
+  const dh=d.decisions.map(x=>`<tr><td>${x.id}</td><td>${CL[x.decision]||x.decision}</td><td>${x.rationale}</td><td>${x.review_id??"—"}</td><td>${x.decided_by}</td><td>${x.created_at}</td></tr>`).join("");
+  decide.innerHTML=`<h2>放行决定</h2>
+    <div class="row">
+      <label>决定 <select id="decision"><option value="release">正式放行</option><option value="conditional">有条件放行</option><option value="reject">拒收</option><option value="resample">再取样</option></select></label>
+      <label>依据 <input id="rationale" size="30" placeholder="决定依据"></label>
+      <label>例外编号 <input id="exceptionCode" size="10"></label>
+      <button onclick="submitDecision()">提交决定</button>
+    </div>
+    ${d.decisions.length?`<h3>决定历史</h3><table><tr><th>#</th><th>决定</th><th>依据</th><th>引用复核</th><th>决定人</th><th>时间</th></tr>${dh}</table>`:""}`;
+}
+async function submitReview(){
+  try{
+    await api(`/api/batches/${current.batch.id}/reviews`,{method:"POST",headers:hdrs(),
+      body:JSON.stringify({conclusion:conclusion.value,opinion:opinion.value,expected_revision:current.batch.revision})});
+    say("复核已保存",true);await loadState(current.batch.id);
+  }catch(e){say(e.message,false)}
+}
+async function submitDecision(){
+  try{
+    await api(`/api/batches/${current.batch.id}/decide`,{method:"POST",headers:hdrs(),
+      body:JSON.stringify({decision:decision.value,rationale:rationale.value,exception_code:exceptionCode.value,expected_revision:current.batch.revision})});
+    say("决定已提交",true);await loadState(current.batch.id);
+  }catch(e){say(e.message,false)}
+}
+loadState();
+</script>
